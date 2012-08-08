@@ -26,11 +26,13 @@ router.get(/^\/api\/services$/).bind(api.services);
 router.get(/^\/api\/services\/([a-z\-]+)$/).bind(api.servicesElement);
 router.get(/^\/api\/summarize$/).bind(api.summarize);
 router.get(/^\/api\/config\/client$/).bind(api.configClient);
+router.get(/^\/api\/plugins\/client$/).bind(api.pluginsClient);
 router.get(/^\/api\/uptime$/).bind(api.uptime);
 router.get(/^\/api\/info$/).bind(api.info);
 
 // static
 var docRoot = __dirname + '/public';
+var pluginsDocRoot = [];
 
 // server
 var server = http.createServer(function(req, res) {
@@ -43,8 +45,18 @@ var server = http.createServer(function(req, res) {
       if (route.status === 404) {
         paperboy.deliver(docRoot, req, res).otherwise(function(err) {
           var pathname = url.parse(req.url).pathname;
-          res.writeHead(route.status, route.headers);
-          res.end(route.body);
+          var pluginDocRootSelect = _.select(pluginsDocRoot, function(data) { return pathname.toString().startsWith(data.prefix); });
+          if (pluginDocRootSelect && pluginDocRootSelect[0]) {
+            var pluginDocRoot = pluginDocRootSelect[0];
+            req.url = pathname.toString().replace(pluginDocRoot.prefix, "");
+            paperboy.deliver(pluginDocRoot.docRoot, req, res).otherwise(function(err) {
+              res.writeHead(404);
+              res.end('File not found.');
+            });
+          } else {
+            res.writeHead(route.status, route.headers);
+            res.end(route.body);
+          }
         });
       } else {
         res.writeHead(route.status, route.headers);
@@ -85,5 +97,13 @@ api.on("routeContribution", function(route) {
   router.route(route.method, route.path).bind(route.binding);
 });
 
+api.on("staticContribution", function(plugin) {
+  util.log("Add static contribution: " + plugin);
+  var docRoot = __dirname + '/plugins/' + plugin + '/public';
+  pluginsDocRoot.push( { prefix: "/api/" + plugin, docRoot: docRoot });
+  util.log("Add static contribution: " + util.inspect(pluginsDocRoot));
+});
+
 util.log('Server started.');
 util.log('Server running at http://' + settings.hostname + ':' + settings.port);
+

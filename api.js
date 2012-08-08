@@ -14,6 +14,20 @@ module.exports = controller;
 
 var pkginfo = require('pkginfo')(module, 'name', 'version', 'description');
 var info = { description: module.exports.description, name: module.exports.name, version: module.exports.version };
+
+fs.readdir(__dirname + '/plugins', function(err, pluginDirectories) {
+  if (!err) {
+    _.each(pluginDirectories, function(directory) {
+      if (fs.statSync(__dirname + '/plugins/' + directory).isDirectory() && fs.statSync(__dirname + '/plugins/' + directory + '/' + directory + '_plugin.js').isFile()) {
+        return require(__dirname + '/plugins/' + directory + '/' + directory + '_plugin.js').create(controller, settings);
+      } else {
+        logger.log("Excluding plugin: " + directory);
+      }
+    });
+  } else {
+    logger.log("Error when creating plugin: " + err);
+  }
+});
   
 var status = {};
 status.lastupdate = new Date().toGMTString();
@@ -58,6 +72,14 @@ var checkHttpStatusCode = function(response, service) {
   service.statusCode = response.statusCode;
 };
 
+var checkRange = function(min, max, value) {
+  if (min && max && value >= min && value < max) {
+    return true;
+  } else if ( (min && value >= min) || (max && value < max) ) {
+    return true;
+  }
+  return false;
+};
 var checkStatusDashboardResponse = function(response, serviceDefinition, service) {
   if(response.statusCode === 200){
     response.on('data', function(chunk){
@@ -74,8 +96,7 @@ var checkStatusDashboardResponse = function(response, serviceDefinition, service
 };
 
 var checkHttpValueResponse = function(response, serviceDefinition, service) {
-  if (response.statusCode == 200) {
-    service.status = 'up'
+  if (response.statusCode == 200 && (serviceDefinition.checkFixedValueResponse || serviceDefinition.checkRangeValuesResponse)) {
     response.on('data', function (chunk) {
       var value = ('' + chunk).substring(0, chunk.length - 1);
       if (serviceDefinition.checkFixedValueResponse) {
@@ -85,7 +106,28 @@ var checkHttpValueResponse = function(response, serviceDefinition, service) {
           service.status = "critical";
           service.message = "Unexpected value " + value;
         }
-      } 
+      } else {
+        if (serviceDefinition.checkRangeValuesResponse) {
+          if (serviceDefinition.checkRangeValuesResponse.length == 0) {
+            service.status = "critical";
+            service.message = "No range defined!";
+          } else {
+            var found = false;
+            for(var i = 0; i < serviceDefinition.checkRangeValuesResponse.length; i++) {
+              var range = serviceDefinition.checkRangeValuesResponse[i];
+              if (checkRange(range.min, range.max, parseInt(value))) {
+                service.status = range.status;
+                found = true;
+                break;
+              }
+            }
+            if (!found) {
+              service.status = "critical";
+              service.message = "No range matches";
+            }
+          }
+        }
+      }
       controller.emit(service.status, service);
     });
   } else {
@@ -93,40 +135,184 @@ var checkHttpValueResponse = function(response, serviceDefinition, service) {
   }
 };
 
-var handleError = function(e,service) {
-  service.status = "down";
-  service.statusCode = 0;
-  service.message = e.message;
-  controller.emit(service.status, service);
-}
-
-var httpOptions = function(serviceDefinition) {
-  return {
-    host: serviceDefinition.host,
-    port: serviceDefinition.port,
-    path: serviceDefinition.path,
-    headers: serviceDefinition.headers
-  }
-}
-
 var commands = {
   http : function(serviceDefinition, service) {
-    http.get(httpOptions(serviceDefinition), function(response) {
+    var options = {
+      host: serviceDefinition.host,
+      port: serviceDefinition.port,
+      path: serviceDefinition.path,
+      headers: serviceDefinition.headers
+    };
+    http.get(options, function(response) {
       service.message = '';
+      checkHttpStatusCode(response, service);
       checkHttpValueResponse(response, serviceDefinition, service);
     })
     .on('error', function(e) {
-      handleError(e,service)
+      service.status = "down";
+      service.statusCode = 0;
+      service.message = e.message;
+      controller.emit(service.status, service);
     });
   },
   https : function(serviceDefinition, service) {
-    https.get(httpOptions(serviceDefinition), function(response) {
+    var options = {
+      host: serviceDefinition.host,
+      port: serviceDefinition.port,
+      path: serviceDefinition.path,
+      headers: serviceDefinition.headers
+    };
+
+    https.get(options, function(response) {
       service.message = '';
+      checkHttpStatusCode(response, service);
       checkHttpValueResponse(response, serviceDefinition, service);
     })
     .on('error', function(e) {
-      handleError(e,service)
+      service.status = "down";
+      service.statusCode = 0;
+      service.message = e.message;
+      controller.emit(service.status, service);
     });
+  },
+  tcp : function(serviceDefinition, service) {
+    var stream = net.createConnection(serviceDefinition.port, serviceDefinition.host);
+    stream.addListener('data', function (buffer) {
+      if (!serviceDefinition.rcv || serviceDefinition.rcv == buffer) {
+        service.status = "up";
+        service.statusCode = 0;
+        service.message = "";
+      } else {
+        service.status = "critical";
+        service.statusCode = 0;
+        service.message = "Expected " + serviceDefinition.rcv + " but was " + buffer;
+      }
+      stream.end();
+      controller.emit(service.status, service);
+    });
+    stream.addListener('connect', function () {
+      stream.write(serviceDefinition.cmd);
+    });
+    stream.addListener('end', function () {
+      stream.end();
+    });
+    stream.addListener('error', function (e) {
+      service.status = "down";
+      service.statusCode = e.errno;
+      service.message = e.message;
+      controller.emit(service.status, service);      
+    });
+  },
+  udp : function(serviceDefinition, service) {
+    var sock = dgram.createSocket("udp4");
+    sock.on("message", function (buffer, from) {
+      if (!serviceDefinition.rcv || serviceDefinition.rcv == buffer) {
+        service.status = "up";
+        service.statusCode = 0;
+        service.message = "";
+      } else {
+        service.status = "critical";
+        service.statusCode = 0;
+        service.message = "Expected " + serviceDefinition.rcv + " but was '" + buffer;
+      }
+      sock.close();
+      controller.emit(service.status, service);
+    });
+    sock.on("error", function (exception) {
+      service.status = "down";
+      service.statusCode = 0;
+      service.message = exception;
+      controller.emit(service.status, service);
+      sock.close();
+    });
+    var buf = new Buffer(serviceDefinition.cmd);
+    sock.send(buf, 0, buf.length, serviceDefinition.port, serviceDefinition.host);
+  },
+  ftp : function(serviceDefinition, service) {
+    service.status = "unknown";
+    service.statusCode = 0;
+    service.message = 'FTP check in progress...';
+
+    var stream = net.createConnection(serviceDefinition.port, serviceDefinition.host);
+
+    stream.addListener('connect', function () {
+      var ftpCommand = function(command, callback) {
+        stream.write(command + '\r\n');
+        var dataCallback = function(data) {
+          stream.removeListener('data', dataCallback);
+          var status = data.toString().match(/^\d\d\d/);
+          if (parseInt(status[0]) > 399) {
+            ftpError(status[0], data.toString());
+          } else {
+            return callback(data);
+          }
+        };
+        stream.addListener('data', dataCallback);
+      };
+
+      ftpCommand('USER ' + service.username, function(data) {
+        ftpCommand('PASS ' + service.password, function(data) {
+          service.status = "up";
+          service.statusCode = 0;
+          service.message = "";
+          controller.emit(service.status, service);
+        });
+      });
+    });
+
+    var ftpError = function(status, message) {
+      service.status = "down";
+      service.statusCode = status;
+      service.message = message;
+      controller.emit(service.status, service);
+    };
+
+    stream.addListener('error', function (e) {
+      service.status = "down";
+      service.statusCode = 0;
+      service.message = e.message;
+      controller.emit(service.status, service);
+    });
+
+  },
+  pidfile : function(serviceDefinition, service) {
+    service.status = "unknown";
+    service.statusCode = 0;
+    service.message = '';
+    var pidfiles = [serviceDefinition.pidfile];
+    
+    if (serviceDefinition.pidfile.constructor === Array) {
+      pidfiles = serviceDefinition.pidfile;
+    }
+    for (var index = 0; index < pidfiles.length; index++) {
+      try {
+        var pid = fs.readFileSync(pidfiles[index]);
+      } catch (e) {
+        service.status = "unknown";
+        service.statusCode = e.errno;
+        service.message = e.message;
+        controller.emit(service.status, service);
+        return;
+      }
+      try {
+        var pidInt = parseInt(pid);
+        if (isNaN(pidInt)) {
+          service.status = "critical";
+          service.message = 'pid \'' + pid + '\' is not a number';
+          return;
+        } else {
+          process.kill(pidInt, 0);
+        }
+      } catch (e) {
+        service.status = "down";
+        service.statusCode = e.errno;
+        service.message = e.message;
+        controller.emit(service.status, service);
+        return;
+      }
+    }
+    service.status = "up";
+    controller.emit(service.status, service);
   },
   statusdashboard : function(serviceDefinition, service) {
     var options = {
@@ -171,6 +357,11 @@ module.exports.configClient = function(req, res) {
   res.send(200, {}, JSON.stringify(settings.client));
 }
 
+module.exports.pluginsClient = function(req, res) {
+  var plugins = _.map(_.select(_.map(settings.plugins, function(num, key) { return { name:key, enable: num.enable, client: num.client } }), function(data) { return (data.enable == true && data.client == true); }), function(num, key) { return { name:num.name } });
+  res.send(200, {}, JSON.stringify(plugins));
+}
+
 module.exports.getStatus = function() {
   return status;
 };
@@ -205,3 +396,4 @@ module.exports.uptime = function(req, res) {
 module.exports.info = function(req, res) {
   res.send(200, {}, info);
 }
+
