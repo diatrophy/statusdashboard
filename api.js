@@ -145,8 +145,12 @@ var commands = {
     };
     http.get(options, function(response) {
       service.message = '';
-      checkHttpStatusCode(response, service);
-      checkHttpValueResponse(response, serviceDefinition, service);
+      if (serviceDefinition.customResponseHandler != null) {
+        serviceDefinition.customResponseHandler.call(response,service,serviceDefinition)
+      } else {
+        checkHttpStatusCode(response, service);
+        checkHttpValueResponse(response, serviceDefinition, service);
+      }
     })
     .on('error', function(e) {
       service.status = "down";
